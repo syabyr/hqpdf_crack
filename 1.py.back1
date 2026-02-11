@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+def extract_with_pypdf(pdf_path: Path) -> tuple[str, object | None]:
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return "", None
+
+    reader = PdfReader(str(pdf_path))
+    parts: list[str] = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    return "\n".join(parts), reader
+
+
+def extract_with_pdfminer(pdf_path: Path) -> str:
+    from pdfminer.high_level import extract_text
+
+    return extract_text(str(pdf_path)) or ""
+
+
+def decode_gb2312_latin1(text: str) -> str:
+    try:
+        return text.encode("latin1", errors="ignore").decode("gb2312", errors="ignore")
+    except Exception:
+        return text
+
+
+def inspect_fonts(reader: object) -> None:
+    try:
+        pages = reader.pages
+    except Exception:
+        print("[inspect] pypdf reader not available.")
+        return
+
+    for page_index, page in enumerate(pages, start=1):
+        resources = page.get("/Resources", {})
+        fonts = resources.get("/Font", {})
+        print(f"[inspect] page {page_index}: {len(fonts)} font(s)")
+        for name, font_ref in fonts.items():
+            try:
+                font = font_ref.get_object()
+            except Exception:
+                font = font_ref
+            subtype = font.get("/Subtype")
+            encoding = font.get("/Encoding")
+            has_tounicode = "/ToUnicode" in font
+            print(
+                f"  {name}: subtype={subtype} encoding={encoding} ToUnicode={has_tounicode}"
+            )
+
+
+def write_text(txt_path: Path, text: str) -> None:
+    txt_path.write_text(text, encoding="utf-8")
+
+
+def write_pdf_from_text(out_pdf: Path, text: str, font_path: str) -> None:
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas
+
+    pdfmetrics.registerFont(TTFont("CNFont", font_path))
+    c = canvas.Canvas(str(out_pdf))
+    c.setFont("CNFont", 12)
+
+    x, y = 40, 800
+    line_height = 16
+    for line in text.splitlines():
+        if y < 40:
+            c.showPage()
+            c.setFont("CNFont", 12)
+            y = 800
+        c.drawString(x, y, line)
+        y -= line_height
+
+    c.save()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("pdf", nargs="?", default="0.pdf")
+    parser.add_argument("--txt", default="0.utf8.txt")
+    parser.add_argument("--pdf-out", default="0.utf8.pdf")
+    parser.add_argument("--decode-gb2312", action="store_true")
+    parser.add_argument("--inspect", action="store_true")
+    parser.add_argument("--make-pdf", action="store_true")
+    parser.add_argument(
+        "--font-path",
+        default="/System/Library/Fonts/STHeiti Medium.ttc",
+    )
+    args = parser.parse_args()
+
+    pdf_path = Path(args.pdf)
+    txt_path = Path(args.txt)
+
+    text, reader = extract_with_pypdf(pdf_path)
+    if not text:
+        text = extract_with_pdfminer(pdf_path)
+
+    if args.inspect and reader is not None:
+        inspect_fonts(reader)
+
+    if args.decode_gb2312:
+        text = decode_gb2312_latin1(text)
+
+    write_text(txt_path, text)
+
+    if args.make_pdf:
+        write_pdf_from_text(Path(args.pdf_out), text, args.font_path)
+
+
+if __name__ == "__main__":
+    main()
