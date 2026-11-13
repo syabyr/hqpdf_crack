@@ -13,6 +13,10 @@ Quartz then draws from the embedded file and extracts text through /ToUnicode, s
 Preview gets a real, searchable text layer. One subset per typeface is shared by
 every page of the document.
 
+Pages are rebuilt from scratch instead of cloned, so no orphaned copy of the old
+resource tree survives (that waste used to nearly double the file size), and the
+outline, /PageMode and /Info are carried over from the source.
+
 usage:
   python pdf_identity_embed_fix.py 1.pdf 111.pdf
   python pdf_identity_embed_fix.py 1.pdf out.pdf --pages 1-20
@@ -22,15 +26,20 @@ import argparse
 import io
 import re
 import sys
+import unicodedata
 
 from fontTools import subset
 from fontTools.ttLib import TTFont
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
     ArrayObject,
+    BooleanObject,
     DecodedStreamObject,
     DictionaryObject,
+    FloatObject,
+    IndirectObject,
     NameObject,
+    NullObject,
     NumberObject,
     TextStringObject,
 )
@@ -301,6 +310,350 @@ def make_stream(writer, data: bytes):
         return writer._add_object(stream)
 
 
+# ------------------------------------------------------- document level copying
+
+def _text_score(text: str) -> int:
+    """How much does this look like real text? Used to pick between UTF-16 orders."""
+    score = 0
+    for char in text:
+        code = ord(char)
+        if code == 0xFFFD or 0xE000 <= code <= 0xF8FF:
+            score -= 3
+        elif code < 0x80 or 0x3000 <= code <= 0x303F or 0xFF01 <= code <= 0xFF5E:
+            score += 1
+        elif 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+            score += 2
+        elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF:
+            score -= 2      # Hangul is the classic symptom of byte-swapped UTF-16
+        elif unicodedata.category(char)[0] in "LNPS":
+            score += 1
+        else:
+            score -= 1
+    return score
+
+
+def decode_text(value) -> str:
+    """Decode a PDF text string the way these producers actually meant it.
+
+    S22PDF-era files store two broken shapes: bare GBK bytes (no BOM), and UTF-16
+    whose payload is big-endian while the BOM claims little-endian. Trusting book
+    metadata or outline titles to pypdf's fallback yields garbage, so decode both
+    shapes here and keep the reading that scores better.
+    """
+    if value is None:
+        return ""
+    try:
+        raw = value.original_bytes
+    except AttributeError:
+        return str(value)
+    if raw[:2] in (b"\xfe\xff", b"\xff\xfe"):
+        body = raw[2:]
+        if len(body) % 2:
+            body = body[:-1]
+        readings = []
+        for codec in ("utf-16-be", "utf-16-le"):
+            try:
+                readings.append(body.decode(codec))
+            except UnicodeDecodeError:
+                readings.append(body.decode(codec, "replace"))
+        return max(readings, key=_text_score)
+    for codec in ("gbk", "utf-8"):
+        try:
+            return raw.decode(codec)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def import_object(writer, value):
+    """Bring one source object into the writer, reusing pypdf's per-document dedupe."""
+    if isinstance(value, IndirectObject):
+        value = value.get_object()
+    if isinstance(value, (NumberObject, FloatObject, BooleanObject, NullObject, NameObject)):
+        return value
+    if not hasattr(value, "clone"):
+        return value
+    clone = value.clone(writer)
+    if getattr(clone, "indirect_reference", None) is not None:
+        return clone.indirect_reference
+    return writer._add_object(clone)
+
+
+def _is_open(node) -> bool:
+    count = node.get("/Count")
+    return True if count is None else int(count) > 0
+
+
+_DROP_CHARS = set(" \u3000、，。：；！？（）()《》“”‘’—―-·,.:;!?/|")
+_DROP_CHARS.update(("\r", "\n", "\t"))
+
+
+def _normalize(text: str) -> str:
+    """Squash a heading so line breaks and punctuation stop mattering."""
+    return "".join(ch for ch in text if ch not in _DROP_CHARS)
+
+
+def _resembles(needle: str, text: str, slack: int = 6) -> bool:
+    """Is `needle` printed somewhere in `text`?
+
+    A stray particle or two is tolerated, because the composed bookmark and the
+    printed heading do not always agree: a bookmark reading 顺生录一 sits above a
+    heading printed 顺生录之一（别录一）.  The characters still have to appear in
+    order inside one short stretch of text, which keeps unrelated pages out.
+    """
+    if needle in text:
+        return True
+    if len(needle) < 4:
+        return False
+    span = len(needle) + slack
+    for start in range(len(text) - 3):
+        window = text[start:start + span]
+        position = matched = 0
+        for char in needle:
+            found = window.find(char, position)
+            if found < 0:
+                break
+            matched += 1
+            position = found + 1
+        if matched * 10 >= len(needle) * 9:
+            return True
+    return False
+
+
+def _page_head(reader, index, limit=90) -> str:
+    """First few characters drawn on a page, used to confirm a bookmark target."""
+    try:
+        content = reader.pages[index].get_contents()
+    except Exception:
+        return ""
+    if content is None:
+        return ""
+    chars = []
+    for _start, _end, _font, raw in iter_strings(content.get_data()):
+        for code in split_codes(raw):
+            if code is None or needs_fallback(code):
+                continue
+            chars.append(chr(code))
+            if len(chars) >= limit:
+                return "".join(chars)
+    return "".join(chars)
+
+
+def _raw_item(array, index):
+    """Read an array element without resolving a page reference to a page object."""
+    try:
+        return list.__getitem__(array, index)
+    except (IndexError, TypeError):
+        return None
+
+
+def _outline_dest(reader, node):
+    """Destination array of an outline node, resolving /A /GoTo and named targets."""
+    dest = node.get("/Dest")
+    if dest is None:
+        action = node.get("/A")
+        if action is None:
+            return None
+        action = action.get_object()
+        if str(action.get("/S")) != "/GoTo":
+            return None
+        dest = action.get("/D")
+    if isinstance(dest, IndirectObject):
+        dest = dest.get_object()
+    if isinstance(dest, (str, NameObject)):
+        named = reader.named_destinations.get(str(dest))
+        if isinstance(named, ArrayObject):
+            return named
+        if isinstance(named, DictionaryObject):
+            page = named.get("/Page")
+            return ArrayObject([page, named.get("/Type") or NameObject("/Fit")]) if page is not None else None
+    return dest if isinstance(dest, ArrayObject) and dest else None
+
+
+def copy_outline(reader, writer, page_refs):
+    """Rebuild /Outlines on the new document.
+
+    These books carry a navigation shell: entries are /GoToR actions into sibling
+    volumes plus /Named viewer commands, so they start out as copies of those
+    actions.  Jumps that really point into this volume are re-pointed at the local
+    pages afterwards, otherwise the bookmark opens nothing.  Titles go through
+    decode_text(), so the byte-swapped ones become readable.
+    """
+    root_ref = reader.trailer["/Root"].get("/Outlines")
+    if root_ref is None:
+        return 0
+    try:
+        root_node = root_ref.get_object()
+    except Exception:
+        return 0
+
+    page_index = {}
+    for position, page in enumerate(reader.pages):
+        ref = getattr(page, "indirect_reference", None)
+        if ref is not None:
+            page_index[ref.idnum] = position
+
+    new_root = writer._add_object(DictionaryObject({
+        NameObject("/Type"): NameObject("/Outlines"),
+    }))
+    copied = 0
+    seen = set()
+    pending = []
+
+    def build(parent_ref, parent_node, depth=0):
+        """Copy parent_node's /First chain; return (first, last, count, visible)."""
+        nonlocal copied
+        if depth > 32:
+            return None, None, 0, 0
+        nodes = []
+        ref = parent_node.get("/First")
+        while ref is not None:
+            node = ref.get_object() if hasattr(ref, "get_object") else ref
+            if id(node) in seen:
+                break
+            seen.add(id(node))
+            nodes.append(node)
+            ref = node.get("/Next")
+        if not nodes:
+            return None, None, 0, 0
+
+        made, opened = [], []
+        for node in nodes:
+            title = decode_text(node.get("/Title"))
+            item = DictionaryObject({
+                NameObject("/Title"): TextStringObject(title or " "),
+                NameObject("/Parent"): parent_ref,
+            })
+            color = node.get("/C")
+            if color:
+                item[NameObject("/C")] = ArrayObject([import_object(writer, c) for c in color])
+            flags = node.get("/F")
+            if flags:
+                item[NameObject("/F")] = NumberObject(int(flags))
+
+            dest = _outline_dest(reader, node)
+            target = None
+            if dest is not None:
+                anchor = _raw_item(dest, 0)
+                position = None
+                if isinstance(anchor, IndirectObject):
+                    position = page_index.get(anchor.idnum)
+                elif isinstance(anchor, int):
+                    position = anchor
+                if position is not None and 0 <= position < len(page_refs):
+                    target = ArrayObject([page_refs[position]] +
+                                         [import_object(writer, v) for v in list(dest)[1:]])
+            remote_index, remote_file = None, None
+            if target is not None:
+                item[NameObject("/Dest")] = target
+            elif "/A" in node:
+                item[NameObject("/A")] = import_object(writer, node.get("/A"))
+                # a cross-file jump may actually be a page of this very book
+                action = node.get("/A")
+                action = action.get_object() if hasattr(action, "get_object") else action
+                jump = action.get("/D")
+                if str(action.get("/S")) == "/GoToR" and isinstance(jump, ArrayObject) and jump:
+                    anchor = _raw_item(jump, 0)
+                    if isinstance(anchor, int) and not isinstance(anchor, bool):
+                        remote_index = int(anchor)
+                        remote_file = str(action.get("/F") or "")
+
+            item_ref = writer._add_object(item)
+            if remote_index is not None:
+                pending.append((item_ref, title, remote_index, remote_file))
+            made.append(item_ref)
+            opened.append(_is_open(node))
+            copied += 1
+
+        below = []
+        for index, item_ref in enumerate(made):
+            item = item_ref.get_object()
+            if index:
+                item[NameObject("/Prev")] = made[index - 1]
+            if index + 1 < len(made):
+                item[NameObject("/Next")] = made[index + 1]
+            child_first, child_last, child_total, child_visible = build(
+                item_ref, nodes[index], depth + 1)
+            if child_first is not None:
+                item[NameObject("/First")] = child_first
+                item[NameObject("/Last")] = child_last
+                item[NameObject("/Count")] = NumberObject(
+                    child_total if opened[index] else -child_total)
+                below.append((child_total, child_visible if opened[index] else 0))
+            else:
+                below.append((0, 0))
+
+        total = sum(1 + child[0] for child in below)
+        visible = sum(1 + child[1] for child in below)
+        return made[0], made[-1], total, visible
+
+    first, last, total, visible = build(new_root, root_node)
+    if first is None:
+        return 0, 0
+
+    # Nearly every entry is a /GoToR jump into the volume this file was cut from,
+    # with 0-based page numbers and no scroll offset.  Detect that volume (the file
+    # most links point at), confirm that its page numbers really do land on the
+    # bookmarks' own headings, and then re-point those links at the local pages so
+    # they navigate instead of asking for a sibling file.  Links into any other
+    # file (the "return to volume contents" jump) are left exactly as they were.
+    volume, seen_files = None, {}
+    for _ref, _title, _index, remote_file in pending:
+        seen_files[remote_file] = seen_files.get(remote_file, 0) + 1
+    if seen_files:
+        volume = max(seen_files, key=lambda name: seen_files[name])
+
+    usable = [entry for entry in pending
+              if entry[3] == volume and 0 <= entry[2] < len(page_refs)]
+    heads, hits = {}, 0
+    for _ref, title, index, _file in usable:
+        if index not in heads:
+            heads[index] = _normalize(_page_head(reader, index, 100000))
+        needle = _normalize(title)[:10]
+        if len(needle) < 4 or len(heads[index]) < 8:
+            continue          # too short to judge, or nothing drawn (cover, scan)
+        if _resembles(needle, heads[index]):
+            hits += 1
+    verified = sum(1 for entry in usable
+                   if len(_normalize(entry[1])[:10]) >= 4
+                   and len(heads.get(entry[2]) or "") >= 8)
+
+    rebound = 0
+    if verified >= 3 and hits * 5 >= verified * 2:      # at least 40 % line up
+        for item_ref, _title, index, _file in usable:
+            item = item_ref.get_object()
+            item[NameObject("/Dest")] = ArrayObject([page_refs[index], NameObject("/Fit")])
+            if NameObject("/A") in item:
+                del item[NameObject("/A")]
+            rebound += 1
+
+    outline = new_root.get_object()
+    outline[NameObject("/First")] = first
+    outline[NameObject("/Last")] = last
+    outline[NameObject("/Count")] = NumberObject(visible)
+    writer._root_object[NameObject("/Outlines")] = new_root
+    return total, rebound
+
+
+def copy_info(reader, writer):
+    """Carry /Title /Author ... over, decoded from GBK where needed."""
+    info = reader.trailer.get("/Info")
+    if info is None:
+        return 0
+    try:
+        source = info.get_object()
+    except Exception:
+        return 0
+    metadata = {}
+    for key, value in source.items():
+        text = decode_text(value)
+        if text:
+            metadata[str(key)] = text
+    if metadata:
+        writer.add_metadata(metadata)
+    return len(metadata)
+
+
 def build_type0_font(writer, base_font, tag, font_data, ttfont, gid_to_unicode):
     scale = 1000.0 / ttfont["head"].unitsPerEm
     head, hhea = ttfont["head"], ttfont["hhea"]
@@ -467,11 +820,22 @@ def main():
               % (key, path, len(gid_to_uni), len(data) / 1024.0))
 
     # ---- pass 3: rewrite and emit
+    # Pages are assembled by hand: writer.add_page() deep-clones the source resource
+    # tree, and the content streams it replaces stay behind as unreachable objects
+    # (that alone nearly doubled the file size).
     rewritten = 0
+    page_refs = []
+    pages_node = DictionaryObject({
+        NameObject("/Type"): NameObject("/Pages"),
+        NameObject("/Kids"): ArrayObject([]),
+        NameObject("/Count"): NumberObject(0),
+    })
+    pages_ref = writer._add_object(pages_node)
+    writer._root_object[NameObject("/Pages")] = pages_ref
+
     for count, index in enumerate(targets, 1):
         page = reader.pages[index]
         alias = aliases[index]
-        new_page = writer.add_page(page)
 
         content = page.get_contents()
         content = content.get_data() if content is not None else b""
@@ -503,23 +867,59 @@ def main():
         output += content[cursor:]
         output = strip_stray_dict_ends(bytes(output))
 
-        if replacements or output != content:
-            new_page[NameObject("/Contents")] = make_stream(writer, output)
-            rewritten += 1
+        new_page = DictionaryObject({
+            NameObject("/Type"): NameObject("/Page"),
+            NameObject("/Parent"): pages_ref,
+        })
+        for key in ("/MediaBox", "/CropBox", "/Rotate", "/BleedBox", "/TrimBox",
+                    "/ArtBox", "/UserUnit", "/Annots", "/Group", "/Tabs"):
+            if key in page:
+                value = page.raw_get(key)
+                new_page[NameObject(key)] = import_object(writer, value)
 
         # keep every untouched font (Type3, Latin faces ...) and override only the
         # resources whose text we actually re-encoded
-        res_dict = DictionaryObject(new_page.get("/Resources") or {})
-        fonts = DictionaryObject(res_dict.get("/Font") or {})
-        for res_name, key in alias.items():
-            if key in shared:
-                fonts[NameObject("/" + res_name)] = shared[key][1]
-        if fonts:
-            res_dict[NameObject("/Font")] = fonts
-            new_page[NameObject("/Resources")] = res_dict
+        source_res = page.get("/Resources")
+        source_res = source_res if source_res is not None else DictionaryObject()
+        resources = DictionaryObject()
+        for key, value in source_res.items():
+            if str(key) != "/Font":
+                resources[NameObject(str(key))] = import_object(writer, value)
+                continue
+            fonts = DictionaryObject()
+            for res_name, ref in (value.get_object() or {}).items():
+                table = shared.get(alias.get(str(res_name).lstrip("/")))
+                fonts[NameObject(str(res_name))] = table[1] if table else import_object(writer, ref)
+            resources[NameObject("/Font")] = fonts
+        new_page[NameObject("/Resources")] = writer._add_object(resources)
+
+        if output != content:
+            new_page[NameObject("/Contents")] = make_stream(writer, output)
+            rewritten += 1
+        else:
+            new_page[NameObject("/Contents")] = import_object(writer, page.raw_get("/Contents"))
+
+        ref = writer._add_object(new_page)
+        page_refs.append(ref)
+        pages_node[NameObject("/Kids")].append(ref)
 
         if count % 100 == 0:
             print("  ... %d/%d pages" % (count, len(targets)))
+
+    pages_node[NameObject("/Count")] = NumberObject(len(page_refs))
+
+    # ---- document level extras the source carried and a bare writer would drop
+    catalog = reader.trailer["/Root"]
+    for key in ("/PageMode", "/PageLayout"):
+        if key in catalog:
+            writer._root_object[NameObject(key)] = NameObject(str(catalog[key]))
+    bookmarks, rebound = copy_outline(reader, writer, page_refs)
+    if bookmarks:
+        print("restored %d bookmark(s)%s" % (
+            bookmarks, ", %d of them re-bound to pages in this file" % rebound if rebound else ""))
+    info_fields = copy_info(reader, writer)
+    if info_fields:
+        print("restored document information (%d field(s))" % info_fields)
 
     with open(args.dst, "wb") as fh:
         writer.write(fh)
