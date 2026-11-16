@@ -21,27 +21,34 @@ class Face:
     """One typeface the converter can rebuild, with its subset tag.
 
     `fragment` is matched against the decoded /BaseFont name; order matters,
-    because 仿宋 contains 宋 and must be tested before it.
+    because 仿宋 contains 宋 and must be tested before it.  `aliases` catches the
+    same faces when a file names them in Latin (SimSun, Songti, STSongti ...),
+    which is how already-subsetted files spell them.
     """
 
     key: str
     tag: str
     fragment: str
     candidates: tuple
+    aliases: tuple = ()
     face_index: int = 0
 
 
 FACES = (
     Face("FangSong", "MNOPQR", "仿宋",
-         ("simfang.ttf", "FangSong.ttf", "fangsong.ttf", "STFangsong.ttf")),
+         ("simfang.ttf", "FangSong.ttf", "fangsong.ttf", "STFangsong.ttf"),
+         ("fangsong", "stfangsong")),
     Face("KaiTi", "STUVWX", "楷",
-         ("simkai.ttf", "KaiTi.ttf", "kaiti.ttf", "STKaiti.ttf", "Kaiti.ttc")),
+         ("simkai.ttf", "KaiTi.ttf", "kaiti.ttf", "STKaiti.ttf", "Kaiti.ttc"),
+         ("kaiti", "stkaiti")),
     Face("SimHei", "GHIJKL", "黑",
          ("simhei.ttf", "simhei.ttc", "SimHei.ttf",
-          "STHeiti Medium.ttc", "STHeiti Light.ttc")),
+          "STHeiti Medium.ttc", "STHeiti Light.ttc"),
+         ("simhei", "heiti", "stheiti")),
     Face("SimSun", "ABCDEF", "宋",
          ("simsun.ttc", "simsun.ttf", "SimSun.ttf", "songti.ttc", "Songti.ttc",
-          "STSong.ttf", "STSongti-SC-Regular.otf")),
+          "STSong.ttf", "STSongti-SC-Regular.otf"),
+         ("simsun", "songti", "stsong")),
 )
 
 

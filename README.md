@@ -41,6 +41,15 @@ and the file does not grow to double size. Bookmarks (`/Outlines`), `/PageMode`,
 classic byte-swapped UTF-16 are decoded properly. Cover-only pages and Type3 fonts
 are left untouched.
 
+Two repairs come along for free. A stray `>>` left by a truncated dictionary —
+which makes a tolerant parser paint the page as a black block — is dropped, so the
+text underneath becomes visible. Codes are decoded as GB18030 rather than GBK, so
+rare characters such as `䴙` and `䴕` survive as themselves instead of becoming
+boxes.
+
+A file that is already `/Identity-H` is detected and refused (exit status 1): its
+string operands are glyph ids, and re-encoding them would scramble the page.
+
 ## Install
 
 ```bash
@@ -97,6 +106,38 @@ from hq_pdf_fix import convert
 written = convert("in.pdf", pages="1-20", font_dir=["/path/to/fonts"])
 print(written)          # -> /path/to/in-1.pdf
 ```
+
+## What it cannot fix
+
+- **User-defined codes.** The GBK private area (`0xA140`–`0xA7A0`, `0xF8`–`0xFE`
+  lead bytes, …) has no Unicode meaning; those characters are drawn as `□` and are
+  not searchable, because there is nothing to search for.
+- **Characters the chosen face lacks.** A rare glyph may exist in SimSun but not in
+  KaiTi, for example `鑑` or `砲`. It is drawn as `□` and drops out of the text
+  layer; the run names every such character. Pin a face with wider coverage via
+  `--font` if it matters.
+- **Fonts it does not recognise.** An unknown `/BaseFont` is reported and left
+  as-is instead of guessed at.
+
+## Validation
+
+`py/validate_pdfs.py` converts a whole directory tree through the installed
+command and measures each result with PDFium — a *different* engine from pypdf —
+so that "it exited 0" is never mistaken for success. Per file it records the page
+count, the characters PDFium can read back, pages that lost their text, every
+warning the converter printed, and (with `--render`) whether the ink still lands
+in the same place:
+
+```bash
+.venv/bin/python py/validate_pdfs.py --root pdf --out validation_logs --render 3
+```
+
+Latest run over this repository's `pdf/` tree: 38 documents / 22,625 pages, zero
+failures, page counts and bookmarks intact, sampled layout within 1–2 px, 379
+character codes with no Unicode mapping on the private-use pages, and 14 distinct
+characters missing from the face that was assigned to them. Four inputs were
+already converted and were skipped correctly. Details in
+`validation_logs/report.md` and `validation_logs/logs/`.
 
 ## Development
 

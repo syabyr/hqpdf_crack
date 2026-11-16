@@ -17,6 +17,7 @@ usage:
   python py/validate_pdfs.py --root pdf --only 毛泽东
 """
 import argparse
+import gc
 import os
 import re
 import subprocess
@@ -28,6 +29,7 @@ import pypdfium2 as pdfium
 
 TEXT_NEEDED = re.compile(r"typefaces needed: \{(.*)\}")
 NO_GBK = "no GBK text found on the selected pages"
+ALREADY = "nothing to convert"
 LEFT_AS_IS = re.compile(r"fonts left as-is[^:]*: (.*)")
 MISSING_GLYPHS = re.compile(r"warning: (\S+) lacks (\d+) glyph")
 NO_UNICODE = re.compile(r"codes with no Unicode mapping.*: (\d+)")
@@ -53,10 +55,17 @@ def text_stats(path, sample_limit=0):
     with pdfium.PdfDocument(str(path)) as doc:
         count = len(doc)
         for index in range(count):
+            text = ""
             try:
                 page = doc[index]
-                text = page.get_textpage().get_text_range()
-                page.close()
+                try:
+                    textpage = page.get_textpage()
+                    try:
+                        text = textpage.get_text_range()
+                    finally:
+                        textpage.close()
+                finally:
+                    page.close()
             except Exception:
                 text = ""
             length = len(text.strip())
@@ -95,6 +104,7 @@ def parse_log(text):
         "faces": "", "left_as_is": [], "missing_glyphs": 0,
         "no_unicode": 0, "pages_untouched": 0, "rewrote": 0,
         "bookmarks": 0, "info_fields": 0, "no_gbk": NO_GBK in text,
+        "already": ALREADY in text,
     }
     match = TEXT_NEEDED.search(text)
     if match:
@@ -114,6 +124,62 @@ def parse_log(text):
     return found
 
 
+def render_check(src, dst, pages=3):
+    """Compare ink boxes and row/column ink profiles of the same pages.
+
+    Pixel equality is the wrong test here: the source does not embed its fonts, so
+    every viewer substitutes a face of its own weight.  What must not change is
+    *where* the ink lands, so the ink bounding box and the projected profiles are
+    compared instead.  Returns (largest box shift in px, lowest profile correlation).
+    """
+    import numpy as np
+
+    def raster(path, index):
+        with pdfium.PdfDocument(str(path)) as doc:
+            page = doc[index]
+            image = page.render(scale=1.0).to_pil().convert("L")
+            page.close()
+        return np.asarray(image)
+
+    worst_shift, worst_corr = 0, 1.0
+    with pdfium.PdfDocument(str(src)) as doc:
+        count = len(doc)
+    for index in sorted(sample_pages(count, pages)):
+        try:
+            before, after = raster(src, index), raster(dst, index)
+        except Exception:
+            return None, None
+        if before.shape != after.shape:
+            return -1, 0.0
+        shift = 0
+        box_b = ink_box(before)
+        box_a = ink_box(after)
+        if box_b and box_a:
+            shift = max(abs(x - y) for x, y in zip(box_b, box_a))
+        corr = min(profile_correlation(before, after, 1), profile_correlation(before, after, 0))
+        worst_shift, worst_corr = max(worst_shift, shift), min(worst_corr, corr)
+    return worst_shift, worst_corr
+
+
+def ink_box(array):
+    import numpy as np
+    mask = array < 160
+    rows = np.where(mask.any(1))[0]
+    cols = np.where(mask.any(0))[0]
+    if not len(rows) or not len(cols):
+        return None
+    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
+
+
+def profile_correlation(before, after, axis):
+    import numpy as np
+    left = before.astype(np.float32).mean(axis)
+    right = after.astype(np.float32).mean(axis)
+    if left.std() < 1e-6 or right.std() < 1e-6:
+        return 1.0
+    return float(np.corrcoef(left, right)[0, 1])
+
+
 def audit(src, dst):
     """Compare source and output with PDFium."""
     result = {"src_pages": pdf_pages(src), "dst_pages": pdf_pages(dst) if dst.exists() else None}
@@ -127,6 +193,8 @@ def audit(src, dst):
 
 
 def verdict(proc, log, metrics):
+    if log["already"]:
+        return "SKIP", "already converted (/Identity-H)"
     if log["no_gbk"]:
         return "SKIP", "no GBK text found"
     if proc.returncode != 0:
@@ -143,8 +211,11 @@ def verdict(proc, log, metrics):
         notes.append("%d glyph(s) missing from font" % log["missing_glyphs"])
     if log["no_unicode"]:
         notes.append("%d code(s) drawn as fallback" % log["no_unicode"])
-    if metrics.get("dst_empty"):
-        notes.append("%d page(s) without text" % metrics["dst_empty"])
+    lost = metrics.get("dst_empty", 0) - metrics.get("src_empty", 0)
+    if lost > 0:
+        notes.append("%d page(s) lost their text" % lost)
+    if metrics.get("shift") is not None and (metrics["shift"] > 8 or metrics.get("corr", 1) < 0.90):
+        notes.append("layout moved (%dpx, corr %.2f)" % (metrics["shift"], metrics["corr"]))
     return ("WARN" if notes else "PASS"), "; ".join(notes)
 
 
@@ -153,6 +224,8 @@ def main():
     ap.add_argument("--root", default="pdf")
     ap.add_argument("--out", default="validation_logs")
     ap.add_argument("--only", default="", help="substring filter on the path")
+    ap.add_argument("--render", type=int, default=0, metavar="N",
+                    help="also compare the layout of N pages per file (slower)")
     ap.add_argument("--timeout", type=int, default=1800)
     args = ap.parse_args()
 
@@ -177,10 +250,15 @@ def main():
 
         log = parse_log(text)
         metrics = audit(src, dst)
+        if args.render and metrics.get("dst_pages"):
+            metrics["shift"], metrics["corr"] = render_check(src, dst, args.render)
         status, note = verdict(proc, log, metrics)
         rows.append({"file": label, "status": status, "note": note, "seconds": elapsed,
                      "log": log, **metrics})
         print("        %-4s %5.1fs  %s" % (status, elapsed, note), flush=True)
+        # PDFium caches pages natively; without a collect the batch grows until the
+        # machine swaps and every later file looks pathologically slow.
+        gc.collect()
 
     write_report(out / "report.md", rows)
     print("\nreport: %s" % (out / "report.md"))
@@ -191,17 +269,20 @@ def main():
 
 def write_report(path, rows):
     lines = ["# hq_pdf_fix validation", ""]
-    lines.append("| status | file | pages | chars (pdfium) | empty pages | mb | s | note |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| status | file | pages | chars (pdfium) | empty pages | mb | s | layout | note |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     order = {"FAIL": 0, "WARN": 1, "SKIP": 2, "PASS": 3}
     for row in sorted(rows, key=lambda item: (order[item["status"]], item["file"])):
         pages = "%s->%s" % (row.get("src_pages"), row.get("dst_pages"))
         chars = "%s->%s" % (row.get("src_chars"), row.get("dst_chars"))
         empty = "%s->%s" % (row.get("src_empty"), row.get("dst_empty"))
         mb = "%.1f->%.1f" % (row.get("src_mb", 0), row.get("dst_mb", 0))
-        lines.append("| %s | `%s` | %s | %s | %s | %s | %.1f | %s |"
+        layout = "-"
+        if row.get("shift") is not None:
+            layout = "%dpx/%.2f" % (row["shift"], row["corr"])
+        lines.append("| %s | `%s` | %s | %s | %s | %s | %.1f | %s | %s |"
                      % (row["status"], row["file"], pages, chars, empty, mb,
-                        row["seconds"], row["note"]))
+                        row["seconds"], layout, row["note"]))
     lines.append("")
     lines.append("## details")
     for row in rows:

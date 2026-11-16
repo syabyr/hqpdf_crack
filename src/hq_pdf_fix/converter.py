@@ -96,9 +96,15 @@ def decode_string(token: bytes) -> bytes:
 
 
 def code_to_unicode(code: bytes):
-    """2-byte GBK code -> code point, or None when the code is not valid GBK."""
+    """2-byte code -> code point, or None when the pair is not valid GBK.
+
+    GB18030 is used rather than GBK because it is a strict superset: codes such as
+    FE9E (䴙) and FE9A (䴕) are real characters that GBK refuses but GB18030 knows,
+    and they do exist in SimSun/SimHei.  Codes that decode into the private use
+    area still have no glyph anywhere, and needs_fallback() sends those to the box.
+    """
     try:
-        char = code.decode("gbk")
+        char = code.decode("gb18030")
     except UnicodeDecodeError:
         return None
     return ord(char) if len(char) == 1 else None
@@ -148,11 +154,41 @@ def iter_strings(content: bytes):
         yield m.start(3), m.end(3), current, decode_string(m.group(3))
 
 
+DELIMITERS = b"\x00\t\n\x0c\r ()<>[]{}/%"
+
+
+def _inline_image_end(data: bytes, start: int):
+    """Offset just past the ``EI`` closing the inline image at `start`, or None.
+
+    The payload between ``ID`` and ``EI`` is arbitrary binary: it may contain
+    ``<<``, ``>>`` or anything else, so it must be copied verbatim instead of
+    being scanned as content tokens.
+    """
+    marker = data.find(b"ID", start)
+    if marker < 0:
+        return None
+    index = marker + 2
+    if index < len(data) and data[index] in b"\x00\t\n\x0c\r ":
+        index += 1
+    while True:
+        found = data.find(b"EI", index)
+        if found < 0:
+            return None
+        before = found - 1
+        after = found + 2
+        if ((before < 0 or data[before] in DELIMITERS)
+                and (after >= len(data) or data[after] in DELIMITERS)):
+            return after
+        index = found + 2
+
+
 def strip_stray_dict_ends(data: bytes) -> bytes:
     """Drop `>>` tokens that close no dictionary.
 
     Some producers emit a truncated `<< ... >>` pair, leaving a bare `>>` at top level.
-    Viewers ignore it but strict content parsers reject the whole page.
+    Viewers ignore it but strict content parsers reject the whole page, which is why
+    a page that fills a rectangle before the stray token can render as a black block.
+    Inline image payloads are skipped so their binary data is never rewritten.
     """
     out = bytearray()
     index = 0
@@ -172,6 +208,16 @@ def strip_stray_dict_ends(data: bytes) -> bytes:
                 elif data[end] == 0x29:
                     nesting -= 1
                 end += 1
+            out += data[index:end]
+            index = end
+            continue
+        if (data[index:index + 2] == b"BI"
+                and (index == 0 or data[index - 1] in DELIMITERS)
+                and (index + 2 >= len(data) or data[index + 2] in DELIMITERS)):
+            end = _inline_image_end(data, index)
+            if end is None:  # unterminated image: keep every remaining byte as it is
+                out += data[index:]
+                break
             out += data[index:end]
             index = end
             continue
@@ -205,18 +251,32 @@ def base_font_name(font_dict) -> str:
         return name
 
 
+def already_glyph_ids(font_dict):
+    """True for a Type0 font already re-encoded to /Identity-H by an earlier run.
+
+    Such a font's string operands are glyph ids, not codes, so re-processing it
+    would scramble the page instead of repairing it.
+    """
+    return (str(font_dict.get("/Subtype")) == "/Type0"
+            and str(font_dict.get("/Encoding")) == "/Identity-H")
+
+
 def classify(font_dict):
     """Typeface key for one font dictionary, or None when it must be left alone.
 
     Type3 fonts draw their glyphs from embedded procedures, so they already work and
-    rewriting them would destroy them. An unrecognised /BaseFont is left untouched too:
+    rewriting them would destroy them. A font that is already /Identity-H needs no
+    work (see already_glyph_ids). An unrecognised /BaseFont is left untouched too:
     guessing a typeface for unknown text would corrupt whatever it really is.
     """
     if str(font_dict.get("/Subtype")) == "/Type3":
         return None
+    if already_glyph_ids(font_dict):
+        return None
     name = base_font_name(font_dict)
+    latin = name.split("+", 1)[-1].lower()  # drop a subset tag such as ABCDEF+
     for face in FACES:
-        if face.fragment in name:
+        if face.fragment in name or any(alias in latin for alias in face.aliases):
             return face.key
     return None
 
@@ -233,7 +293,7 @@ def page_resources(page):
     return None
 
 
-def page_alias(page, unknown=None):
+def page_alias(page, unknown=None, converted=None):
     """Map /Font resource name -> typeface key for one page."""
     resources = page_resources(page)
     if not resources:
@@ -250,7 +310,10 @@ def page_alias(page, unknown=None):
             continue
         name = str(res_name).lstrip("/")
         if key is None:
-            if unknown is not None and str(font_dict.get("/Subtype")) != "/Type3":
+            if already_glyph_ids(font_dict):
+                if converted is not None:
+                    converted.add((name, base_font_name(font_dict) or "<no /BaseFont>"))
+            elif unknown is not None and str(font_dict.get("/Subtype")) != "/Type3":
                 unknown.add((name, base_font_name(font_dict) or "<no /BaseFont>"))
             continue
         alias[name] = key
@@ -761,6 +824,9 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = ap.parse_args(argv)
     dst = args.dst or default_output(args.src)
+    # Files from this era carry dates like "D:00000000000000"; pypdf logs a warning
+    # for every field it reinterprets as a unix timestamp, which drowns the report.
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
 
     global FALLBACK_CHAR, FALLBACK_UNICODE
     if args.fallback == "blank":
@@ -789,9 +855,10 @@ def main(argv=None):
     aliases = {}
     fallback_count = 0
     unknown = set()
+    converted = set()
     for index in targets:
         page = reader.pages[index]
-        alias = page_alias(page, unknown)
+        alias = page_alias(page, unknown, converted)
         aliases[index] = alias
         content = page.get_contents()
         content = content.get_data() if content is not None else b""
@@ -813,6 +880,10 @@ def main(argv=None):
             empty_pages.append(index)
 
     if not used:
+        if converted:
+            sys.exit("nothing to convert: the %d font(s) on the selected pages already "
+                     "use /Identity-H, so their text is stored as glyph ids already"
+                     % len(converted))
         sys.exit("no GBK text found on the selected pages")
     for chars in used.values():
         chars.add(FALLBACK_UNICODE)
@@ -824,6 +895,9 @@ def main(argv=None):
     if unknown:
         print("fonts left as-is (add --font NAME=path to convert them): %s"
               % ", ".join("/%s(%s)" % (n, f) for n, f in sorted(unknown)))
+    if converted:
+        print("fonts already /Identity-H, nothing to re-encode: %s"
+              % ", ".join("/%s(%s)" % (n, f) for n, f in sorted(converted)))
 
     # ---- pass 2: build one subset per typeface
     writer = PdfWriter()
