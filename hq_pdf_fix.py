@@ -18,12 +18,14 @@ resource tree survives (that waste used to nearly double the file size), and the
 outline, /PageMode and /Info are carried over from the source.
 
 usage:
-  python pdf_identity_embed_fix.py 1.pdf 111.pdf
-  python pdf_identity_embed_fix.py 1.pdf out.pdf --pages 1-20
-  python pdf_identity_embed_fix.py in.pdf out.pdf --font "仿宋=sample/simfang.ttf"
+  python hq_pdf_fix.py 1.pdf                        # writes 1-1.pdf beside it
+  python hq_pdf_fix.py 1.pdf 111.pdf                # explicit output path
+  python hq_pdf_fix.py 1.pdf --pages 1-20
+  python hq_pdf_fix.py in.pdf out.pdf --font "仿宋=fonts/simfang.ttf"
 """
 import argparse
 import io
+import os
 import re
 import sys
 import unicodedata
@@ -46,11 +48,12 @@ from pypdf.generic import (
 
 # (name fragment, font file, face index) -- matched against /BaseFont, first hit wins.
 # Order matters: 仿宋 contains 宋, so it must be tested first.
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_LIBRARY = [
-    ("仿宋", "sample/simfang.ttf", 0, "FangSong", "MNOPQR"),
-    ("楷", "sample/simkai.ttf", 0, "KaiTi", "STUVWX"),
-    ("黑", "sample/simhei.ttf", 0, "SimHei", "GHIJKL"),
-    ("宋", "sample/simsun.ttc", 0, "SimSun", "ABCDEF"),
+    ("仿宋", "simfang.ttf", 0, "FangSong", "MNOPQR"),
+    ("楷", "simkai.ttf", 0, "KaiTi", "STUVWX"),
+    ("黑", "simhei.ttf", 0, "SimHei", "GHIJKL"),
+    ("宋", "simsun.ttc", 0, "SimSun", "ABCDEF"),
 ]
 
 # Codes in the GBK user-defined area (A590, AEEC, FEBD ...) carry no standard Unicode and
@@ -481,11 +484,11 @@ def copy_outline(reader, writer, page_refs):
     """
     root_ref = reader.trailer["/Root"].get("/Outlines")
     if root_ref is None:
-        return 0
+        return 0, 0
     try:
         root_node = root_ref.get_object()
     except Exception:
-        return 0
+        return 0, 0
 
     page_index = {}
     for position, page in enumerate(reader.pages):
@@ -727,16 +730,35 @@ def parse_pages(spec, total):
     return [p for p in chosen if 0 <= p < total]
 
 
+def default_output(src: str) -> str:
+    """Output path used when none is given: `book.pdf` -> `book-1.pdf`, same folder.
+
+    The conversion leaves the original untouched beside its fixed copy, matching how
+    the repaired volumes in this repo are named.  A second run on the same source
+    never clobbers the previous result: the counter moves on to -2, -3 ...
+    """
+    folder, filename = os.path.split(os.path.abspath(src))
+    stem, ext = os.path.splitext(filename)
+    candidate = os.path.join(folder, "%s-1%s" % (stem, ext))
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, "%s-%d%s" % (stem, counter, ext))
+        counter += 1
+    return candidate
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
-    ap.add_argument("dst")
+    ap.add_argument("dst", nargs="?",
+                    help="output path (default: <source folder>/<name>-1<ext>)")
     ap.add_argument("--pages", help="1-based page list, e.g. 1-20,25 (default: all)")
     ap.add_argument("--font", action="append", default=[],
-                    help="override mapping, e.g. --font 仿宋=sample/simfang.ttf")
+                    help="override mapping, e.g. --font 仿宋=fonts/simfang.ttf")
     ap.add_argument("--fallback", choices=["box", "blank"], default="box",
                     help="glyph for codes with no Unicode mapping (default: box)")
     args = ap.parse_args()
+    dst = args.dst or default_output(args.src)
 
     global FALLBACK_CHAR, FALLBACK_UNICODE
     if args.fallback == "blank":
@@ -751,7 +773,7 @@ def main():
     total = len(reader.pages)
     targets = parse_pages(args.pages, total)
     print("source: %s (%d pages), converting %d page(s)" % (args.src, total, len(targets)))
-
+    print("output: %s" % dst)
     # ---- pass 1: collect the code points each typeface needs
     used, empty_pages = {}, []
     aliases = {}
@@ -801,6 +823,8 @@ def main():
             continue
         if fragment in overrides:
             path = overrides[fragment]
+        else:
+            path = os.path.join(FONT_DIR, path)
         data, ttfont = subset_font(path, face_index, used[key])
         cmap = ttfont.getBestCmap()
         char_to_gid, gid_to_uni, missing = {}, {}, []
@@ -921,9 +945,9 @@ def main():
     if info_fields:
         print("restored document information (%d field(s))" % info_fields)
 
-    with open(args.dst, "wb") as fh:
+    with open(dst, "wb") as fh:
         writer.write(fh)
-    print("rewrote text on %d page(s); wrote %s" % (rewritten, args.dst))
+    print("rewrote text on %d page(s); wrote %s" % (rewritten, dst))
 
 
 if __name__ == "__main__":
