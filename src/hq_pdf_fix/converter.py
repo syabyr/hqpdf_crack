@@ -18,13 +18,14 @@ resource tree survives (that waste used to nearly double the file size), and the
 outline, /PageMode and /Info are carried over from the source.
 
 usage:
-  python hq_pdf_fix.py 1.pdf                        # writes 1-1.pdf beside it
-  python hq_pdf_fix.py 1.pdf 111.pdf                # explicit output path
-  python hq_pdf_fix.py 1.pdf --pages 1-20
-  python hq_pdf_fix.py in.pdf out.pdf --font "仿宋=fonts/simfang.ttf"
+  hq_pdf_fix 1.pdf                                  # writes 1-1.pdf beside it
+  hq_pdf_fix 1.pdf 111.pdf                          # explicit output path
+  hq_pdf_fix 1.pdf --pages 1-20
+  hq_pdf_fix in.pdf --font "仿宋=/usr/share/fonts/simfang.ttf"
 """
 import argparse
 import io
+import logging
 import os
 import re
 import sys
@@ -46,15 +47,9 @@ from pypdf.generic import (
     TextStringObject,
 )
 
-# (name fragment, font file, face index) -- matched against /BaseFont, first hit wins.
-# Order matters: 仿宋 contains 宋, so it must be tested first.
-FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-FONT_LIBRARY = [
-    ("仿宋", "simfang.ttf", 0, "FangSong", "MNOPQR"),
-    ("楷", "simkai.ttf", 0, "KaiTi", "STUVWX"),
-    ("黑", "simhei.ttf", 0, "SimHei", "GHIJKL"),
-    ("宋", "simsun.ttc", 0, "SimSun", "ABCDEF"),
-]
+from . import __version__
+from . import fonts
+from .fonts import FACES
 
 # Codes in the GBK user-defined area (A590, AEEC, FEBD ...) carry no standard Unicode and
 # no glyph in any normal font. They are drawn as a hollow box so the hole stays visible,
@@ -210,7 +205,7 @@ def base_font_name(font_dict) -> str:
         return name
 
 
-def classify(font_dict, overrides: dict):
+def classify(font_dict):
     """Typeface key for one font dictionary, or None when it must be left alone.
 
     Type3 fonts draw their glyphs from embedded procedures, so they already work and
@@ -220,12 +215,9 @@ def classify(font_dict, overrides: dict):
     if str(font_dict.get("/Subtype")) == "/Type3":
         return None
     name = base_font_name(font_dict)
-    for fragment, key in overrides.items():
-        if fragment and fragment in name:
-            return key
-    for fragment, _path, _idx, key, _tag in FONT_LIBRARY:
-        if fragment in name:
-            return key
+    for face in FACES:
+        if face.fragment in name:
+            return face.key
     return None
 
 
@@ -241,7 +233,7 @@ def page_resources(page):
     return None
 
 
-def page_alias(page, overrides, unknown=None):
+def page_alias(page, unknown=None):
     """Map /Font resource name -> typeface key for one page."""
     resources = page_resources(page)
     if not resources:
@@ -253,7 +245,7 @@ def page_alias(page, overrides, unknown=None):
     for res_name, ref in fonts.items():
         try:
             font_dict = ref.get_object()
-            key = classify(font_dict, overrides)
+            key = classify(font_dict)
         except Exception:
             continue
         name = str(res_name).lstrip("/")
@@ -268,6 +260,9 @@ def page_alias(page, overrides, unknown=None):
 # ---------------------------------------------------------------- font building
 
 def subset_font(path, face_index, unicodes):
+    # fontTools logs every table it cannot subset (feat/morx/meta in system .ttc
+    # faces); harmless, but it buries the progress output of a CLI run.
+    logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
     font = TTFont(path, fontNumber=face_index) if path.lower().endswith(".ttc") else TTFont(path)
     options = subset.Options()
     options.recalc_bounds = True
@@ -747,31 +742,46 @@ def default_output(src: str) -> str:
     return candidate
 
 
-def main():
-    ap = argparse.ArgumentParser()
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="hq_pdf_fix",
+        description="Rewrite a GBK-passthrough PDF so that macOS Preview can both "
+                    "render and select text.")
     ap.add_argument("src")
     ap.add_argument("dst", nargs="?",
                     help="output path (default: <source folder>/<name>-1<ext>)")
     ap.add_argument("--pages", help="1-based page list, e.g. 1-20,25 (default: all)")
-    ap.add_argument("--font", action="append", default=[],
-                    help="override mapping, e.g. --font 仿宋=fonts/simfang.ttf")
+    ap.add_argument("--font", action="append", default=[], metavar="FRAGMENT=PATH",
+                    help="embed this file for a typeface, e.g. --font 宋=fonts/simsun.ttc "
+                         "(fragments: %s)" % ", ".join(face.fragment for face in FACES))
+    ap.add_argument("--font-dir", action="append", default=[], metavar="DIR",
+                    help="extra directory to look for the CJK faces in (repeatable)")
     ap.add_argument("--fallback", choices=["box", "blank"], default="box",
                     help="glyph for codes with no Unicode mapping (default: box)")
-    args = ap.parse_args()
+    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    args = ap.parse_args(argv)
     dst = args.dst or default_output(args.src)
 
     global FALLBACK_CHAR, FALLBACK_UNICODE
     if args.fallback == "blank":
         FALLBACK_CHAR, FALLBACK_UNICODE = "\u3000", 0x3000
 
+    # --font maps a typeface to the file that should be embedded, keyed by the
+    # canonical fragment (宋/黑/楷/仿宋) that names it in /BaseFont.
+    fragments = {face.fragment: face for face in FACES}
     overrides = {}
     for item in args.font:
         fragment, _, path = item.partition("=")
-        overrides[fragment] = path
+        face = fragments.get(fragment)
+        if face is None:
+            sys.exit("--font %r: unknown typeface, expected one of %s"
+                     % (fragment, ", ".join(face.fragment for face in FACES)))
+        overrides[face.fragment] = path
 
     reader = PdfReader(args.src)
     total = len(reader.pages)
     targets = parse_pages(args.pages, total)
+    font_dirs = fonts.search_dirs(args.font_dir)
     print("source: %s (%d pages), converting %d page(s)" % (args.src, total, len(targets)))
     print("output: %s" % dst)
     # ---- pass 1: collect the code points each typeface needs
@@ -781,7 +791,7 @@ def main():
     unknown = set()
     for index in targets:
         page = reader.pages[index]
-        alias = page_alias(page, overrides, unknown)
+        alias = page_alias(page, unknown)
         aliases[index] = alias
         content = page.get_contents()
         content = content.get_data() if content is not None else b""
@@ -818,17 +828,20 @@ def main():
     # ---- pass 2: build one subset per typeface
     writer = PdfWriter()
     shared = {}
-    for fragment, path, face_index, key, tag in FONT_LIBRARY:
-        if key not in used:
+    for face in FACES:
+        if face.key not in used:
             continue
-        if fragment in overrides:
-            path = overrides[fragment]
+        if face.fragment in overrides:
+            path = overrides[face.fragment]
         else:
-            path = os.path.join(FONT_DIR, path)
-        data, ttfont = subset_font(path, face_index, used[key])
+            try:
+                path = str(fonts.resolve(face, font_dirs))
+            except LookupError as error:
+                sys.exit("%s" % error)
+        data, ttfont = subset_font(path, face.face_index, used[face.key])
         cmap = ttfont.getBestCmap()
         char_to_gid, gid_to_uni, missing = {}, {}, []
-        for uni in sorted(used[key]):
+        for uni in sorted(used[face.key]):
             glyph = cmap.get(uni)
             if glyph is None:
                 missing.append(chr(uni))
@@ -839,9 +852,10 @@ def main():
         if missing:
             print("  warning: %s lacks %d glyph(s): %s"
                   % (path, len(missing), "".join(missing[:20])))
-        shared[key] = (char_to_gid, build_type0_font(writer, key, tag, data, ttfont, gid_to_uni))
+        shared[face.key] = (char_to_gid,
+                            build_type0_font(writer, face.key, face.tag, data, ttfont, gid_to_uni))
         print("  %-9s %-24s %5d glyphs  subset %6.1f KB"
-              % (key, path, len(gid_to_uni), len(data) / 1024.0))
+              % (face.key, path, len(gid_to_uni), len(data) / 1024.0))
 
     # ---- pass 3: rewrite and emit
     # Pages are assembled by hand: writer.add_page() deep-clones the source resource
@@ -910,11 +924,11 @@ def main():
             if str(key) != "/Font":
                 resources[NameObject(str(key))] = import_object(writer, value)
                 continue
-            fonts = DictionaryObject()
+            font_dict = DictionaryObject()
             for res_name, ref in (value.get_object() or {}).items():
                 table = shared.get(alias.get(str(res_name).lstrip("/")))
-                fonts[NameObject(str(res_name))] = table[1] if table else import_object(writer, ref)
-            resources[NameObject("/Font")] = fonts
+                font_dict[NameObject(str(res_name))] = table[1] if table else import_object(writer, ref)
+            resources[NameObject("/Font")] = font_dict
         new_page[NameObject("/Resources")] = writer._add_object(resources)
 
         if output != content:
@@ -948,7 +962,24 @@ def main():
     with open(dst, "wb") as fh:
         writer.write(fh)
     print("rewrote text on %d page(s); wrote %s" % (rewritten, dst))
+    return dst
 
 
-if __name__ == "__main__":
-    main()
+def convert(src, dst=None, pages=None, font=None, font_dir=(), fallback="box"):
+    """Programmatic entry point, same work as the ``hq_pdf_fix`` command.
+
+    Returns the path that was written.  ``font`` takes the same "fragment=path"
+    strings as --font, ``font_dir`` the same extra directories as --font-dir.
+    """
+    argv = [str(src)]
+    if dst is not None:
+        argv.append(str(dst))
+    if pages:
+        argv += ["--pages", str(pages)]
+    for item in font or ():
+        argv += ["--font", item]
+    for directory in font_dir:
+        argv += ["--font-dir", str(directory)]
+    if fallback != "box":
+        argv += ["--fallback", fallback]
+    return main(argv)

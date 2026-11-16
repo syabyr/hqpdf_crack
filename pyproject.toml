@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hq-pdf-fix"
+version = "0.1.0"
+description = "Rewrite legacy GBK-passthrough Chinese PDFs into self-contained Identity-H PDFs with a real, searchable text layer"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["pdf", "gbk", "gb2312", "cjk", "chinese", "identity-h", "tounicode", "preview", "text-layer"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Text Processing :: Markup",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pypdf>=5.0",
+    "fonttools>=4.40",
+]
+
+[project.optional-dependencies]
+# only needed to cross-check a result with a second engine
+verify = ["pypdfium2>=4.0"]
+
+[project.scripts]
+hq_pdf_fix = "hq_pdf_fix.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mybays/hqpdf_crack"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hq_pdf_fix"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/hq_pdf_fix",
+    "/README.md",
+]

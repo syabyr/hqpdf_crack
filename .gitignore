@@ -1,0 +1,19 @@
+# build output
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# bytecode
+__pycache__/
+*.py[cod]
+
+# virtualenvs
+.venv/
+venv/
+
+# local validation output
+validation_logs/
+
+# macOS
+.DS_Store
